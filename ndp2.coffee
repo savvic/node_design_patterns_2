@@ -1,4 +1,6 @@
 # NodeJS design patterns 2 ed.
+# code:
+# https://github.com/PacktPublishing/Node.js_Design_Patterns_Second_Edition_Code
 
 log = console.log.bind(console)
 fs = require 'fs'
@@ -228,20 +230,25 @@ findPattern = (files, regex) ->
         emiter.emit 'error', err
       emiter.emit('fileread', file)
       if match = data.match(regex)
-        log 'emit'
-        # match.forEach (elem) -> emiter.emit('found', file, elem)
+        log "match is an array: "
+        log match
+        match.forEach (elem) ->
+          log file
+          log elem
+          emiter.emit('found', file, elem)
   emiter
 
-findPattern ['fileA.txt'], /hello \w+/g
+findPattern(['fileA.txt'], /hello \w+/g)
   .on 'fileread', (file) -> log "#{file} was read"
   .on 'error', (err) -> log err.message
-  .on 'found', (file, match) -> log "#{match} foound in file #{file}"
+  .on 'found', (file, match) -> log "#{match} found in file #{file}"
 
 # FindPattern prototype that we defined extends EventEmitter using the inherits() function provided by the core module util
 
 class FindPatternClass extends EventEmitter
-  constructor: (@regex) ->
+  constructor: (regex) ->
     super()
+    @regex = regex
     @files = []
   addFile: (file) ->
     @files.push file
@@ -249,8 +256,7 @@ class FindPatternClass extends EventEmitter
   find: ->
     @files.forEach (file) ->
       fs.readFile file, 'utf8', (err, data) ->
-        if err
-          @emit 'error', err
+        @emit 'error', err if err
         # @emit('fileread', file)
         # if match = data.match(@regex)
         #   log 'emit'
@@ -266,7 +272,250 @@ findPatternObject
   .on 'error', (err) -> log err.message
 
 
-# Synchronous and asynchronous events - the way listeners can be registered
+# Synchronous and asynchronous events - the way listeners can be registered *************   web spider
+
+mkdirp = require 'mkdirp'
+path = require 'path'
+request = require 'request'
+utilities = require './utilities.js'
+
+# writes a given string to a file can be easily factored out
+fileSave = (filename, content, callback) ->
+  mkdirp path.dirname(filename), (err) ->
+    if err then callback(err)
+    fs.writeFile filename, content, callback
+# downloads the URL into the given file
+fileDownload = (url, filename, callback) ->
+  log "Downloading #{url}"
+  request url, (err, response, body) ->
+    callback(err) if err
+    fileSave filename, body, (err) ->
+      if err then callback(err)
+      log "Downloaded and saved #{filename}"
+      callback(null, body)
+
+
+spider1 = (url, cb) ->
+  log url
+  filename = utilities.urlToFilename(url)
+  fs.exists filename, (exists) ->
+    if not exists
+      log "Downloading #{url}"
+      request url, (err, response, body) ->
+        if err then cb(err)
+        else
+          mkdirp path.dirname(filename), (err) ->
+          if err then cb(err)
+          else
+            fs.writeFile filename, body, (err) ->
+              if err then cb(err)
+              else
+                cb null, filename, true
+    else
+      cb null, filename, false
+
+
+spider2 = (url, cb) ->
+  filename = utilities.urlToFilename(url)
+  fs.exists filename, (exists) ->
+    cb(null, filename, false) if exists
+    fileDownload url, filename, (err) ->
+      cb(err) if err
+      cb null, filename, true
+
+# spider2 'https://www.ultimatum.group/ultimatum.html', (err, filename, downloaded) ->
+#   if err then log err
+#   else if downloaded
+#     log "complete the download #{filename}"
+#   else
+#     log "#{filename} was already downloaded"
+
+
+# Sequential execution   **************************************************************
+
+task1 = (callback) ->
+  asyncOperation = -> task2(callback)
+
+task2 = (callback) ->
+  asyncOperation = -> task3(callback)
+
+task3 = (callback) ->
+  asyncOperation = -> callback()
+
+# using a sequential asynchronous iteration algorithm
+spiderLinks = (currentUrl, body, nesting, callback) ->
+  process.nextTick(callback) if nesting is 0
+  links = utilities.getPageLinks(currentUrl, body)
+  iterate = (index) ->
+    return callback() if index is links.length
+    spider links[index], nesting - 1, (err) ->
+      callback(err) if err
+      iterate(index + 1)
+  iterate(0)
+
+spiderLinksParallel = (currentUrl, body, nesting, callback) ->
+  process.nextTick(callback) if nesting is 0
+  links = utilities.getPageLinks(currentUrl, body)
+  process.nextTick(callback) if links.length is 0
+  completed = 0
+  hasErrors = false
+  # trick to make our application wait for all the tasks to complete is to provide the spider() function with a special callback done().
+  done = (err) ->
+    if err
+      hasErrors = true
+      callback(err)
+    if ++completed is links.length and not hasErrors then callback()
+  links.forEach (link) -> # iterating over the links array and starting each task without waiting for the previous one to finish
+    spider link, nesting - 1, done
+
+# QUEUE   ******************************************************************************
+
+class TaskQueue
+  constructor: (@concurrency) ->
+    @running = 0
+    @queue = []
+
+  pushTask = (task) ->
+    @queue.push(task)
+    @next()
+
+  next = ->
+    while @running < @concurrency and @queue.length
+      task = @queue.shift()
+      task () ->
+        @running--
+        @next()
+      @running++
+
+downloadQueue = new TaskQueue(2)
+
+spiderLinksQueue = (currentUrl, nesting, body, callback) ->
+  return process.nextTick(callback) if nesting is 0
+  links = utilities.getPageLinks(currentUrl, body)
+  return process.nextTick(callback) if links.length is 0
+  completed = 0
+  hasErrors = false
+  links.forEach (link) ->
+    downloadQueue.pushTask (done) ->
+      spider link, nesting - 1, (err) ->
+        if err
+          hasErrors = true
+          callback(err)
+        if ++completed is links.length and not hasErrors
+          callback()
+        done()
+
+
+# spider adjusted:
+spidering = new Map
+spider = (url, nesting, callback) ->
+  if spidering.has(url)
+    process.nextTick(callback)
+  spidering.set url, true
+  log 'this is spidering: '
+  log spidering
+  filename = utilities.urlToFilename(url)
+  fs.readFile filename, 'utf8', (err, body) ->
+    if err
+      callback(err) if err.code isnt 'ENOENT'
+      fileDownload url, filename, (err, body) ->
+        callback(err) if err
+        spiderLinksQueue(url, nesting, body, callback)
+    spiderLinksQueue(url, nesting, body, callback)
+
+
+# pattern can be adapted to any situation where we have the need to iterate asynchronously
+# in sequence over the elements of a collection or in general over a list of tasks
+# general version:
+tasks = ['https://www.ultimatum.group', 'https://www.ultimatum.group/ultimatum.html']
+finish = -> log 'iteration completed'
+iteration = (index) ->
+  finish() if index is tasks.length
+  task = tasks[index]
+  tasker = ->
+    log task
+    iteration(index + 1)
+iteration(0)
+
+# Parallel execution   ****************************************************************
+# general version:
+completed_ = 0
+tasks.forEach (tazk) ->
+  tazk = () -> finish() if ++completed is tasks.length
+
+# `
+# let complet = 0;
+# tasks.forEach(task => {
+#   task(() => {
+#     if(++complet === tasks.length) {
+#       finish();
+#     }
+#   });
+# });
+# `
+
+# pattern to execute a set of given tasks in parallel with limited concurrency.
+# general version:
+concure = 2
+running = 0
+compl = 0
+ind = 0
+next = ->
+  while running < concure and ind < tasks.length
+    task = tasks[index++]
+    do
+      if compl is tasks.length
+        finish()
+      compl++
+      running--
+      next()
+    running++
+  next()
+
+
+# PROMISE   ****************************************************************************************************************
+
+# To receive the fulfillment value or the error (reason) associated with the rejection, we use the then() method of the promise
+# promise.then([onFulfilled], [onRejected])
+# onFulfilled() is a function that will eventually receive the fulfillment value
+# onRejected() is another function that will receive the reason for the rejection
+
+# typical CPS - continous passing style:
+#
+# asyncOperation(arg, (err, result) => {
+#   if(err) {
+#     // handle error
+#   }
+#   // do stuff with result
+#   });
+
+# promise way:
+
+# asyncOperation(arg)
+#   .then(result => {
+#     //do stuff with result
+#   }, err => {
+#     //handle error
+#   });
+
+# if we don't specify an onFulfilled() or onRejected() handler, the fulfillment value or rejection reasons are
+# automatically forwarded to the next promise in the chain.
+
+# asyncOperation(arg)
+#   .then(result1 => {
+#     //returns another promise
+#     return asyncOperation(arg2);
+#   })
+#   .then(result2 => {
+#     //returns a value
+#     return 'done';
+#   })
+#   .then(undefined, err => {
+#     //any error in the chain is caught here
+#   });
+
+
+
 
 
 
